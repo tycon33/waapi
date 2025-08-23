@@ -1,0 +1,1 @@
+/* instanceManager.js file content would be here */
