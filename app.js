@@ -1,5 +1,5 @@
 // app.js
-require('dotenv').config?.(); // safe optional: only works if you add dotenv
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const fileUpload = require('express-fileupload');
@@ -9,7 +9,8 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
-
+const winston = require('winston');
+const os = require('os-utils');
 const {
   createInstance,
   getInstance,
@@ -20,7 +21,7 @@ const {
   getInfo,
   logoutInstance,
   resetInstance,
-  restartInstance,   // ✅ ensure imported for recovery
+  restartInstance,
   instances,
   qrCodes
 } = require('./instanceManager');
@@ -28,88 +29,114 @@ const {
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// ---------- Global Middleware ----------
-app.use(cors({ origin: '*', methods: ['GET','POST','DELETE'], allowedHeaders: ['Content-Type'] }));
+// ==========================
+// Logging Setup (Winston)
+// ==========================
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.printf(info => `${info.timestamp} ${info.level}: ${info.message}`)
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: 'app.log' }),
+  ],
+});
+
+// ==========================
+// Middleware Setup
+// ==========================
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
 app.use(express.json({ limit: '10mb' }));
-app.use(fileUpload({ limits: { fileSize: 25 * 1024 * 1024 }, abortOnLimit: true })); // 25 MB cap
+app.use(fileUpload({
+  limits: { fileSize: 25 * 1024 * 1024 },
+  abortOnLimit: true
+}));
 
-// Basic request logger (lightweight; no extra deps)
-app.use((req, _res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
-  next();
+// ==========================
+// Utility Functions
+// ==========================
+function getId(req) {
+  return (req.params.id || '').trim();
+}
+
+function sendError(res, status, message, details = null) {
+  return res.status(status).json({ error: message, ...(details ? { details } : {}) });
+}
+
+// ==========================
+// Health Check Endpoint
+// ==========================
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'OK',
+    memoryUsage: process.memoryUsage().rss,
+    cpuUsage: os.cpuUsage(),
+    instances: instances.size,
+  });
 });
 
-// Health check (useful for uptime monitors / PM2)
-app.get('/', (_req, res) => res.json({ ok: true, service: 'waapi', time: new Date().toISOString() }));
-
-// ---------- Routes (all preserved) ----------
-
-// Create instance
+// ==========================
+// Routes Setup
+// ==========================
 app.post('/instance/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  if (!id) return res.status(400).json({ error: 'Instance id is required' });
+  const id = getId(req);
+  if (!id) return sendError(res, 400, 'Instance id is required');
+  if (instances.has(id)) return sendError(res, 400, 'Instance already exists');
 
-  try {
-    await createInstance(id);
-    res.json({ success: true, message: `Instance ${id} created` });
-  } catch (err) {
-    console.error('Create instance error:', err);
-    res.status(500).json({ error: 'Failed to create instance', details: err.message });
-  }
+  createInstance(id)
+    .then(() => logger.info(`Instance ${id} initialization started`))
+    .catch(err => logger.error(`Instance ${id} creation error:`, err.message));
+
+  return res.json({ success: true, message: `Instance ${id} creation started` });
 });
 
-// Delete instance
 app.delete('/instance/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  if (!id) return res.status(400).json({ error: 'Instance id is required' });
-
+  const id = getId(req);
   try {
     const result = await deleteInstance(id);
-    if (result) return res.json({ success: true });
-    return res.status(404).json({ error: 'Instance not found' });
+    if (!result) return sendError(res, 404, 'Instance not found');
+    return res.json({ success: true });
   } catch (err) {
-    console.error('Delete instance error:', err);
-    res.status(500).json({ error: 'Failed to delete instance', details: err.message });
+    logger.error(`Delete instance [${id}] error:`, err.message);
+    return sendError(res, 500, 'Failed to delete instance', err.message);
   }
 });
 
-// Get QR code image (base64)
 app.get('/qr/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  if (!id) return res.status(400).json({ error: 'Instance id is required' });
-
+  const id = getId(req);
   try {
     if (!instances.has(id)) {
-      await createInstance(id);
+      createInstance(id).catch(e => logger.error('Background create error:', e.message));
+      return res.status(202).json({ message: 'Instance creation started, QR not available yet' });
     }
 
     const client = instances.get(id);
-    if (client && client.info) {
-      return res.status(400).json({ error: 'Already connected. QR not needed.' });
-    }
+    if (client?.info) return sendError(res, 400, 'Already connected. QR not needed.');
 
     const qr = qrCodes.get(id);
-    if (!qr) {
-      return res.status(404).json({ error: 'QR not available. Instance may be connected or not created.' });
-    }
+    if (!qr) return sendError(res, 404, 'QR not available. Instance may be connected or not ready.');
 
     const base64Image = await QRCode.toDataURL(qr);
     return res.json({ qr_image: base64Image });
   } catch (err) {
-    console.error('QR generation failed:', err);
-    return res.status(500).json({ error: 'Failed to generate QR image.', details: err.message });
+    logger.error(`QR generation [${id}] failed:`, err.message);
+    return sendError(res, 500, 'Failed to generate QR image.', err.message);
   }
 });
 
-// Get status + info
 app.get('/status/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  if (!id) return res.status(400).json({ error: 'Instance id is required' });
-
-  const status = getStatus(id);
+  const id = getId(req);
   try {
+    const status = getStatus(id);
     const info = await getInfo(id);
-    res.json({
+    return res.json({
       id,
       status,
       number: info?.number || null,
@@ -117,190 +144,43 @@ app.get('/status/:id', async (req, res) => {
       profile_pic: info?.profile_pic || null
     });
   } catch (err) {
-    console.error(`Failed to get status info for ${id}:`, err);
-    res.status(500).json({ error: 'Failed to get status info', details: err.message });
+    logger.error(`Status fetch [${id}] failed:`, err.message);
+    return sendError(res, 500, 'Failed to get status info', err.message);
   }
 });
 
-// Get client info only
-app.get('/info/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  if (!id) return res.status(400).json({ error: 'Instance id is required' });
-
-  try {
-    const info = await getInfo(id);
-    if (info) return res.json(info);
-    return res.status(404).json({ error: 'Instance not found or not connected' });
-  } catch (err) {
-    console.error('Get info error:', err);
-    res.status(500).json({ error: 'Failed to get info', details: err.message });
+// ==========================
+// Graceful Shutdown
+// ==========================
+process.on('SIGINT', () => {
+  logger.info('Received SIGINT, shutting down gracefully...');
+  for (const [id, client] of instances.entries()) {
+    client.destroy().catch(err => logger.error(`Failed to disconnect instance ${id}: ${err.message}`));
   }
+  process.exit(0);
 });
 
-// Logout instance
-app.post('/logout/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  if (!id) return res.status(400).json({ error: 'Instance id is required' });
-
-  try {
-    const result = await logoutInstance(id);
-    if (result) return res.json({ success: true, message: `Instance ${id} logged out` });
-    return res.status(404).json({ error: 'Instance not found or logout failed' });
-  } catch (err) {
-    console.error('Logout error:', err);
-    res.status(500).json({ error: 'Failed to logout', details: err.message });
+process.on('SIGTERM', () => {
+  logger.info('Received SIGTERM, shutting down gracefully...');
+  for (const [id, client] of instances.entries()) {
+    client.destroy().catch(err => logger.error(`Failed to disconnect instance ${id}: ${err.message}`));
   }
+  process.exit(0);
 });
 
-// Reset instance
-app.post('/reset/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  if (!id) return res.status(400).json({ error: 'Instance id is required' });
-
-  try {
-    const result = await resetInstance(id);
-    if (result) return res.json({ success: true, message: `Instance ${id} has been reset` });
-    return res.status(404).json({ error: 'Instance not found or failed to reset' });
-  } catch (err) {
-    console.error('Reset error:', err);
-    res.status(500).json({ error: 'Failed to reset instance', details: err.message });
-  }
-});
-
-// Send text message
-app.post('/send/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  const client = getInstance(id);
-  if (!client) return res.status(404).json({ error: 'Instance not found or not connected' });
-
-  const { number, message } = req.body || {};
-  if (!number || !message) return res.status(400).json({ error: 'number and message are required' });
-  if (!number.endsWith('@c.us') && !number.endsWith('@g.us'))
-    return res.status(400).json({ error: 'number must include @c.us or @g.us' });
-
-  try {
-    await client.sendMessage(number, message);
-    res.json({ success: true, to: number, message });
-  } catch (err) {
-    console.error('Send message error:', err);
-    res.status(500).json({ error: 'Failed to send message', details: err.message });
-  }
-});
-
-// Send media (supports upload, fileUrl, filePath)
-app.post('/send-media/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  const client = getInstance(id);
-  if (!client) return res.status(404).json({ error: 'Instance not found or not connected' });
-
-  const { number, fileUrl, filePath, caption } = req.body || {};
-  if (!number) return res.status(400).json({ error: 'number is required' });
-
-  try {
-    let media;
-
-    if (req.files && req.files.media) {
-      const mediaFile = req.files.media;
-      const mimeType = mediaFile.mimetype;
-      const base64Data = mediaFile.data.toString('base64');
-      media = new MessageMedia(mimeType, base64Data, mediaFile.name);
-
-    } else if (fileUrl) {
-      const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
-      const mimeType = response.headers['content-type'] || mime.lookup(fileUrl);
-      const base64Data = Buffer.from(response.data, 'binary').toString('base64');
-      media = new MessageMedia(mimeType, base64Data, path.basename(fileUrl));
-
-    } else if (filePath) {
-      if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ error: 'Local file not found' });
-      }
-      const mimeType = mime.lookup(filePath);
-      if (!mimeType) return res.status(400).json({ error: 'Cannot determine file type from filePath' });
-      const fileData = fs.readFileSync(filePath, { encoding: 'base64' });
-      media = new MessageMedia(mimeType, fileData, path.basename(filePath));
-
-    } else {
-      return res.status(400).json({ error: 'Either file upload (media), fileUrl or filePath is required' });
-    }
-
-    await client.sendMessage(number, media, { caption: caption || '' });
-    res.json({ success: true, message: 'Media sent successfully' });
-
-  } catch (error) {
-    console.error('Error sending media:', error);
-
-    if (String(error.message || '').match(/Target closed|Browser disconnected|Protocol error/i)) {
-      try {
-        await restartInstance(id);
-        return res.status(503).json({
-          error: 'Instance restarted due to browser disconnect. Please retry your request.'
-        });
-      } catch (restartError) {
-        return res.status(500).json({
-          error: 'Failed to restart instance after browser disconnect.',
-          details: restartError.message
-        });
-      }
-    }
-
-    res.status(500).json({ error: 'Failed to send media', details: error.message });
-  }
-});
-
-// Get all chats
-app.get('/chats/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  const client = getInstance(id);
-  if (!client) return res.status(404).json({ error: 'Instance not found or not connected' });
-
-  try {
-    const chats = await client.getChats();
-    res.json(chats.map(chat => ({
-      id: chat.id._serialized,
-      name: chat.name || chat.formattedTitle || chat.id.user,
-      isGroup: chat.isGroup
-    })));
-  } catch (err) {
-    console.error('Error fetching chats:', err);
-    res.status(500).json({ error: 'Failed to fetch chats', details: err.message });
-  }
-});
-
-// Get groups only
-app.get('/groups/:id', async (req, res) => {
-  const id = (req.params.id || '').trim();
-  const client = getInstance(id);
-  if (!client) return res.status(404).json({ error: 'Instance not found or not connected' });
-
-  try {
-    const chats = await client.getChats();
-    const groups = chats.filter(chat => chat.isGroup);
-    res.json(groups.map(group => ({
-      id: group.id._serialized,
-      name: group.name || group.formattedTitle
-    })));
-  } catch (err) {
-    console.error('Error fetching groups:', err);
-    res.status(500).json({ error: 'Failed to fetch groups', details: err.message });
-  }
-});
-
-// ---------- Global error handler (last) ----------
-app.use((err, _req, res, _next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error', details: err.message });
-});
-
-// ---------- Start server & restore sessions ----------
+// ==========================
+// Start Server
+// ==========================
 (async () => {
   try {
     await restoreSessions();
-  } catch (e) {
-    console.error('restoreSessions error:', e.message);
+  } catch (err) {
+    logger.warn('restoreSessions error:', err.message || err);
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 WhatsApp API server running on http://0.0.0.0:${PORT}`);
+    const serverIp = process.env.SERVER_IP || '0.0.0.0';
+    logger.info(`🚀 WhatsApp API server running on http://${serverIp}:${PORT}`);
+    logger.info(`(listening on 0.0.0.0:${PORT} — reachable via your VPS public IP)`);
   });
 })();
